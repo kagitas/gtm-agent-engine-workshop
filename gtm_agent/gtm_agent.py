@@ -68,13 +68,12 @@ def build_prospect_profile(prospect_id: str) -> dict:
 
 
 SCORING_PROMPT = (
-    "You are a GTM assistant. Score the prospect's potential for the offering from "
-    "1 to 100 based on how good a fit they are, weighing their annual revenue and "
-    "tech stack. In your justification, explicitly list which of the offering's required "
-    "technologies the prospect has and which required technologies they are missing, naming "
-    "each one. Any missing required technology must lower the tech_stack_match component and "
-    "the overall score. Return a score and a justification that reflects your "
-    "overall assessment of this prospect's potential."
+    "You are a GTM assistant. Assess the prospect's segment fit for the offering from "
+    "0 to 100 and write a justification for the computed rubric. In your justification, "
+    "explicitly list which of the offering's required technologies the prospect has and "
+    "which required technologies they are missing, naming each one. Use the computed "
+    "revenue_fit and tech_stack_match values provided in the request; do not recalculate "
+    "or replace them. Return only segment_fit and justification."
 )
 
 from typing import Literal
@@ -93,13 +92,52 @@ class ProspectScore(BaseModel):
     rubric_breakdown: RubricBreakdown
 
 
-_scoring_llm = ChatOpenAI(model=MODEL_NAME, temperature=0).with_structured_output(ProspectScore)
+class ScoringAssessment(BaseModel):
+    segment_fit: float
+    justification: str
+
+
+# Revenue and technology fit drive the score equally; segment fit is a secondary factor.
+REVENUE_WEIGHT = 0.4
+TECH_STACK_WEIGHT = 0.4
+SEGMENT_WEIGHT = 0.2
+
+
+_scoring_llm = ChatOpenAI(model=MODEL_NAME, temperature=0).with_structured_output(ScoringAssessment)
 
 
 def _offering_has_required_fields(offering):
     "Return True if the offering has the fields needed to score against it."
-    return bool(offering) and bool(offering.get("required_tech_stack")) and \
+    return bool(offering) and offering.get("required_tech_stack") is not None and \
         offering.get("min_annual_revenue") is not None and bool(offering.get("description"))
+
+
+def _compute_tech_stack_match(prospect_profile, offering):
+    required_tech_stack = offering.get("required_tech_stack") or []
+    if not required_tech_stack:
+        return 100.0
+    prospect_tech_stack = {
+        str(technology).casefold()
+        for technology in prospect_profile.get("tech_stack") or []
+    }
+    matched_count = sum(
+        str(technology).casefold() in prospect_tech_stack
+        for technology in required_tech_stack
+    )
+    return round(100 * matched_count / len(required_tech_stack), 2)
+
+
+def _compute_revenue_fit(prospect_profile, offering):
+    "Return 100 at the minimum, proportional fit below it, or 0 when missing."
+    annual_revenue = prospect_profile.get("annual_revenue")
+    if annual_revenue is None:
+        return 0.0
+    minimum_revenue = offering["min_annual_revenue"]
+    if annual_revenue >= minimum_revenue:
+        return 100.0
+    if minimum_revenue <= 0:
+        return 0.0
+    return round(max(0, 100 * annual_revenue / minimum_revenue), 2)
 
 
 @tool
@@ -111,15 +149,36 @@ def score_prospect(prospect_profile: dict, offering: dict | None = None) -> dict
     pid = prospect_profile.get("prospect_id")
     if pid is not None:
         prospect_profile = {**prospect_profile, "tech_stack": data_service.fetch_tech_stack(pid)}
+    revenue_fit = _compute_revenue_fit(prospect_profile, offering)
+    tech_stack_match = _compute_tech_stack_match(prospect_profile, offering)
     user = (
         "Offering:\n" + json.dumps(offering, indent=2) +
-        "\n\nProspect profile:\n" + json.dumps(prospect_profile, indent=2)
+        "\n\nProspect profile:\n" + json.dumps(prospect_profile, indent=2) +
+        "\n\nComputed rubric values:\n" + json.dumps({
+            "revenue_fit": revenue_fit,
+            "tech_stack_match": tech_stack_match,
+        }, indent=2)
     )
     result = _scoring_llm.invoke([
         {"role": "system", "content": SCORING_PROMPT},
         {"role": "user", "content": user},
     ])
-    return result.model_dump()
+    segment_fit = round(result.segment_fit, 2)
+    score = round(
+        REVENUE_WEIGHT * revenue_fit +
+        TECH_STACK_WEIGHT * tech_stack_match +
+        SEGMENT_WEIGHT * segment_fit,
+        2,
+    )
+    return ProspectScore(
+        score=score,
+        justification=result.justification,
+        rubric_breakdown=RubricBreakdown(
+            revenue_fit=revenue_fit,
+            tech_stack_match=tech_stack_match,
+            segment_fit=segment_fit,
+        ),
+    ).model_dump()
 
 
 @tool
